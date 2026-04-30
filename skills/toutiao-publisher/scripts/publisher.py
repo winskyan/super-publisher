@@ -7,6 +7,7 @@ Navigates to the publish page with authenticated session.
 import sys
 import argparse
 import time
+import platform
 from pathlib import Path
 import os
 
@@ -19,7 +20,7 @@ from auth_manager import AuthManager
 from browser_utils import BrowserFactory
 
 
-from md2html import convert as md_to_html
+from md2html import convert_safe, markdown_to_plain
 
 
 def publish(
@@ -57,16 +58,18 @@ def publish(
     #     )
     #     return False
 
-    # Convert Markdown to HTML if content is provided
+    # Convert Markdown to minimal HTML (ProseMirror / Toutiao often rejects <h*>/<ul>/<b> from insertHTML).
     final_html = ""
     if content_html and not raw:
-        print("🔄 Converting Markdown to HTML...")
+        print("🔄 Converting Markdown to HTML (safe paragraphs + <strong> only)...")
         try:
-            final_html = md_to_html(content_html)
+            final_html = convert_safe(content_html)
             print(f"  HTML preview: {final_html[:100]}...")
         except Exception as e:
             print(f"⚠️ Conversion failed, using raw text: {e}")
             final_html = content_html
+    elif content_html and raw:
+        final_html = content_html
 
     print(f"🚀 Launching Toutiao Publisher (Headless: {headless})...")
 
@@ -173,37 +176,50 @@ def publish(
             except Exception as e:
                 print(f"  ⚠️ Error handling overlays: {e}")
 
-            # 1. Fill Title
-            if title:
+            def fill_title_field() -> None:
+                """Prefer placeholder / maxlength; avoid wrong first-textarea (abstract/summary)."""
+                if not title:
+                    return
                 print(f"✍️ Filling title: {title[:20]}...")
-                try:
-                    title_filled = False
-
-                    # Method A: Placeholder Contains "标题"
-                    print("  Attempting to fill title...")
-                    title_input = page.locator("textarea").first
-                    if title_input.count() > 0:
-                        title_input.fill(title)
-                        title_filled = True
-                        print("  Filled first textarea with title.")
-                    else:
-                        # Fallback
-                        print("  Falling back to placeholder search...")
-                        title_input_ph = page.get_by_placeholder("标题", exact=False)
-                        if title_input_ph.count() > 0:
-                            title_input_ph.first.fill(title)
+                title_filled = False
+                selectors = [
+                    'textarea[placeholder*="标题"]',
+                    'input[placeholder*="标题"]',
+                    'textarea[maxlength="30"]',
+                    'input[maxlength="30"]',
+                ]
+                for sel in selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if loc.count() > 0 and loc.is_visible():
+                            loc.fill(title)
+                            print(f"  Title via: {sel}")
                             title_filled = True
-                            print("  Filled by placeholder.")
+                            break
+                    except Exception:
+                        pass
+                if not title_filled:
+                    try:
+                        ph = page.get_by_placeholder("标题", exact=False).first
+                        if ph.count() > 0 and ph.is_visible():
+                            ph.fill(title)
+                            print("  Title via: placeholder 标题")
+                            title_filled = True
+                    except Exception:
+                        pass
+                if not title_filled:
+                    try:
+                        ti = page.locator("textarea").first
+                        if ti.count() > 0 and ti.is_visible():
+                            ti.fill(title)
+                            print("  Title via: first textarea (fallback)")
+                            title_filled = True
+                    except Exception:
+                        pass
+                if not title_filled:
+                    print("❌ Could not identify title input.")
 
-                    if not title_filled:
-                        print("❌ Could not identify title input.")
-
-                except Exception as e:
-                    print(f"⚠️ Failed to fill title: {e}")
-
-                take_screenshot("after_title")
-
-            # 2. Fill Content
+            # 1. Fill body first (then title) — some MP backends autosave validate body+title together.
             if content_html:
                 print("📝 Filling article content with HTML paste...")
                 try:
@@ -216,79 +232,237 @@ def publish(
 
                     editor = page.locator(".ProseMirror").first
                     if editor.count() > 0:
-                        editor.click()
-                        editor.clear()
 
-                        # Prepare plain text version (original markdown or stripped)
-                        # We pass 'content_html' (which is actually the raw text/markdown passed to func if conversion failed,
-                        # but in our flow 'content_html' arg to publish() IS the markdown if we called it right)
-                        # Wait, let's look at the arguments.
-                        # publish(content_html=...) receives the raw file content.
-                        # Then we convert it to 'final_html'.
-                        # So 'content_html' is the plain text source.
+                        def editor_select_all_clear():
+                            editor.click()
+                            time.sleep(0.2)
+                            mod = "Meta" if platform.system() == "Darwin" else "Control"
+                            page.keyboard.press(f"{mod}+a")
+                            time.sleep(0.1)
+                            page.keyboard.press("Backspace")
+                            time.sleep(0.3)
 
-                        # Use robust argument passing to avoid JS parsing errors
-                        print("  Attempting content fill via execCommand...")
-
-                        # Pass data safely to JS environment
-                        eval_args = {"html": final_html}
-
-                        filled = page.evaluate(
-                            """(data) => {
-                            const editor = document.querySelector('.ProseMirror');
-                            if (editor) {
+                        def paste_html_into_prosemirror(html: str) -> bool:
+                            eval_args = {"html": html}
+                            return page.evaluate(
+                                """(data) => {
+                                const editor = document.querySelector('.ProseMirror');
+                                if (!editor) return false;
                                 editor.focus();
-                                // Try insertHTML first - usually most reliable for WYSIWYG
-                                const success = document.execCommand('insertHTML', false, data.html);
-                                if (!success) {
-                                    // Fallback to clipboard event
-                                    console.log('execCommand failed, trying clipboard event');
-                                    const clipboardData = new DataTransfer();
-                                    clipboardData.setData('text/html', data.html);
-                                    // Create paste event
-                                    const pasteEvent = new ClipboardEvent('paste', {
-                                        bubbles: true,
-                                        cancelable: true,
-                                        clipboardData: clipboardData
-                                    });
-                                    editor.dispatchEvent(pasteEvent);
+                                const ok = document.execCommand('insertHTML', false, data.html);
+                                if (!ok) {
+                                    const dt = new DataTransfer();
+                                    dt.setData('text/html', data.html);
+                                    editor.dispatchEvent(new ClipboardEvent('paste', {
+                                        bubbles: true, cancelable: true, clipboardData: dt
+                                    }));
                                 }
                                 return true;
-                            }
-                            return false;
-                        }""",
-                            eval_args,
+                            }""",
+                                eval_args,
+                            )
+
+                        def click_save_draft_if_visible() -> bool:
+                            for label in (
+                                "保存草稿",
+                                "存草稿",
+                                "存入草稿",
+                                "暂存草稿",
+                            ):
+                                try:
+                                    loc = page.get_by_text(label, exact=True)
+                                    if loc.count() > 0 and loc.first.is_visible():
+                                        loc.first.click()
+                                        return True
+                                except Exception:
+                                    pass
+                            return False
+
+                        def failure_toast_visible() -> bool:
+                            # Do NOT use page.locator("text=…") — help/sidebar may contain "保存失败".
+                            roots = (
+                                page.locator(".semi-toast-wrapper").filter(
+                                    has_text="保存失败"
+                                ),
+                                page.locator(".semi-toast").filter(has_text="保存失败"),
+                                page.locator(".byte-toast").filter(has_text="保存失败"),
+                                page.locator(".arco-message").filter(has_text="保存失败"),
+                                page.locator(".arco-notification").filter(
+                                    has_text="保存失败"
+                                ),
+                                page.locator("[role='alert']").filter(
+                                    has_text="保存失败"
+                                ),
+                            )
+                            for loc in roots:
+                                try:
+                                    if loc.count() > 0 and loc.first.is_visible():
+                                        return True
+                                except Exception:
+                                    pass
+                            return False
+
+                        def success_toast_visible(labels: tuple) -> bool:
+                            for ok in labels:
+                                roots = (
+                                    page.locator(".semi-toast-wrapper").filter(
+                                        has_text=ok
+                                    ),
+                                    page.locator(".semi-toast").filter(has_text=ok),
+                                    page.locator(".byte-toast").filter(has_text=ok),
+                                    page.locator(".arco-message").filter(has_text=ok),
+                                    page.locator(".arco-notification").filter(
+                                        has_text=ok
+                                    ),
+                                    page.locator("[role='alert']").filter(has_text=ok),
+                                )
+                                for loc in roots:
+                                    try:
+                                        if loc.count() > 0 and loc.first.is_visible():
+                                            return True
+                                    except Exception:
+                                        pass
+                            return False
+
+                        def log_scoped_failure_toast_once() -> None:
+                            try:
+                                msg = page.evaluate(
+                                    """() => {
+                                    const qs = [
+                                      '.semi-toast-wrapper',
+                                      '.semi-toast',
+                                      '.byte-toast',
+                                      '.arco-message',
+                                      '.arco-notification',
+                                      '[role="alert"]'
+                                    ];
+                                    for (const s of qs) {
+                                      const nodes = document.querySelectorAll(s);
+                                      for (const el of nodes) {
+                                        if (!el || !el.offsetParent) continue;
+                                        const t = (el.innerText || '').trim();
+                                        if (t.includes('保存失败')) return t.slice(0, 400);
+                                      }
+                                    }
+                                    return '';
+                                }"""
+                                )
+                                if msg:
+                                    print(f"  Failure toast text: {msg!r}")
+                            except Exception:
+                                pass
+
+                        def poll_save_status(
+                            draft_saved_labels: tuple,
+                            save_draft_labels: tuple,
+                            rounds: int = 30,
+                        ) -> bool:
+                            screenshot_done = False
+                            space_triggers = 0
+                            logged_fail_text = False
+                            for _ in range(rounds):
+                                if failure_toast_visible():
+                                    if not logged_fail_text:
+                                        log_scoped_failure_toast_once()
+                                        logged_fail_text = True
+                                    print(
+                                        "❌ Scoped toast: save failure (not page-wide text match)."
+                                    )
+                                    if not screenshot_done:
+                                        take_screenshot("save_failed")
+                                        screenshot_done = True
+                                    page.keyboard.press("Escape")
+                                    time.sleep(0.5)
+                                    clicked = False
+                                    for label in save_draft_labels:
+                                        try:
+                                            loc = page.get_by_text(label, exact=True)
+                                            if (
+                                                loc.count() > 0
+                                                and loc.first.is_visible()
+                                            ):
+                                                print(f"  Clicking '{label}'...")
+                                                loc.first.click()
+                                                clicked = True
+                                                time.sleep(2)
+                                                break
+                                        except Exception:
+                                            pass
+                                    if not clicked and space_triggers < 2:
+                                        print("  Typing space to trigger autosave...")
+                                        editor.type(" ")
+                                        space_triggers += 1
+                                    time.sleep(2)
+                                if success_toast_visible(draft_saved_labels):
+                                    return True
+                                time.sleep(0.8)
+                            return False
+
+                        def fill_plain_text(md_source: str) -> None:
+                            plain = markdown_to_plain(md_source)
+                            if not plain:
+                                return
+                            print(
+                                "  Fallback: filling body as plain text (insert_text)..."
+                            )
+                            editor_select_all_clear()
+                            editor.click()
+                            chunk = 600
+                            for i in range(0, len(plain), chunk):
+                                page.keyboard.insert_text(plain[i : i + chunk])
+                                time.sleep(0.03)
+                            time.sleep(0.5)
+
+                        draft_saved_labels = (
+                            "草稿已保存",
+                            "保存成功",
+                        )
+                        save_draft_labels = (
+                            "保存草稿",
+                            "存草稿",
+                            "存入草稿",
+                            "暂存草稿",
                         )
 
-                        time.sleep(3)
-                        print("✅ Content pasted via JS event.")
+                        # Avoid editor.clear() — can desync ProseMirror doc vs DOM.
+                        editor_select_all_clear()
+                        if final_html and final_html.strip():
+                            print(
+                                "  Attempting content fill via execCommand (safe HTML)..."
+                            )
+                            paste_html_into_prosemirror(final_html)
+                            time.sleep(2)
+                            print("✅ Content pasted via JS event.")
+                        else:
+                            print("  No HTML body; using plain-text fill...")
+                            fill_plain_text(content_html)
 
-                        # Verify Draft Saved Status
+                        if title:
+                            print("  (After body) filling title before autosave poll...")
+                            fill_title_field()
+
+                        print("  Waiting for autosave...")
+                        time.sleep(5)
                         print("  Checking save status...")
-                        saved_successfully = False
-                        for _ in range(10):
-                            if page.get_by_text("保存失败").is_visible():
-                                print("❌ Alert: 'Save Failed' detected!")
-                                take_screenshot("save_failed")
+                        click_save_draft_if_visible()
+                        time.sleep(2)
 
-                                # Attempt retrieval: Click "Save Draft" button if exists
-                                save_btn = page.get_by_text("保存草稿")
-                                if save_btn.is_visible():
-                                    print("  Clicking 'Save Draft' manually...")
-                                    save_btn.click()
-                                else:
-                                    # Try typing a space
-                                    print("  Typing space to trigger autosave...")
-                                    editor.type(" ")
-                                time.sleep(3)
+                        saved_successfully = poll_save_status(
+                            draft_saved_labels, save_draft_labels
+                        )
 
-                            if page.get_by_text("草稿已保存").is_visible():
-                                print("✅ Draft saved successfully.")
-                                saved_successfully = True
-                                break
-                            time.sleep(1)
+                        if not saved_successfully and content_html:
+                            fill_plain_text(content_html)
+                            time.sleep(4)
+                            click_save_draft_if_visible()
+                            time.sleep(2)
+                            saved_successfully = poll_save_status(
+                                draft_saved_labels, save_draft_labels, rounds=36
+                            )
 
-                        if not saved_successfully:
+                        if saved_successfully:
+                            print("✅ Draft saved successfully.")
+                        else:
                             print(
                                 "⚠️ Warning: content might not be saved. Publishing might fail."
                             )
@@ -299,6 +473,13 @@ def publish(
                     print(f"⚠️ Failed to fill content: {e}")
 
                 take_screenshot("after_content")
+
+            if title and not content_html:
+                try:
+                    fill_title_field()
+                except Exception as e:
+                    print(f"⚠️ Failed to fill title: {e}")
+                take_screenshot("after_title")
 
             # 3. Cover Image Processing
             if cover_image_path:

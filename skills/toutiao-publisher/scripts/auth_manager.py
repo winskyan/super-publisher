@@ -25,6 +25,7 @@ from config import (
     DATA_DIR,
     LOGIN_URL,
     HOME_URL,
+    PROFILE_INDEX_URL,
 )
 from browser_utils import BrowserFactory
 
@@ -120,29 +121,40 @@ class AuthManager:
             print("\n  ⏳ Please log in to your Toutiao account...")
             print(f"  ⏱️  Waiting up to {timeout_minutes} minutes for login...")
             print("  (Please scan the QR code or login with password)")
+            print(
+                "  💡 If you already scanned but this hangs: in **this** browser window only, "
+                "open https://mp.toutiao.com/profile_v4/index (or click 进入后台). "
+                "Do not use another Chrome profile."
+            )
 
             try:
-                # Wait for URL to be the home page or dashboard, implying login success
-                # Often it redirects to https://mp.toutiao.com/profile_v4/index or similar
-                # timeout_ms = int(timeout_minutes * 60 * 1000)
+                # Wait for URL to be the home page or dashboard, implying login success.
+                # After QR scan, redirect may be mp.toutiao.com/*, or briefly sso.toutiao.com,
+                # or a new tab while the login tab keeps the old URL — we scan every page.
+
+                def url_looks_logged_in(url: str) -> bool:
+                    if not url or url.startswith("about:"):
+                        return False
+                    # Still on the dedicated login route
+                    if "auth/page/login" in url:
+                        return False
+                    # MP creator backend (most post-login URLs)
+                    if "mp.toutiao.com" in url:
+                        return True
+                    # Explicit deep links (any host)
+                    if "profile_v4" in url or "graphic/publish" in url:
+                        return True
+                    return False
 
                 start_time = time.time()
+                last_debug = start_time
                 while time.time() - start_time < (timeout_minutes * 60):
                     # Check all pages in the context
                     login_detected = False
                     for p in context.pages:
                         try:
                             current_url = p.url
-
-                            # Check for success indicators
-                            is_login_page = "auth/page/login" in current_url
-                            is_toutiao_domain = "mp.toutiao.com" in current_url
-                            is_profile_page = "profile_v4" in current_url
-
-                            # Check URL match
-                            if (
-                                not is_login_page and is_toutiao_domain
-                            ) or is_profile_page:
+                            if url_looks_logged_in(current_url):
                                 print(
                                     f"  ✅ Login successful! (Detected in tab: {current_url})"
                                 )
@@ -150,6 +162,51 @@ class AuthManager:
                                 break
                         except Exception:
                             continue
+
+                    # Every 15s: print tab URLs + nudge stuck tabs (QR often sets cookies but
+                    # the login tab never updates its URL; same profile as "open tabs" list).
+                    now = time.time()
+                    if now - last_debug >= 15:
+                        try:
+                            urls = []
+                            for p in context.pages:
+                                try:
+                                    urls.append(p.url or "(empty)")
+                                except Exception:
+                                    urls.append("(unreadable)")
+                            print(f"  … still waiting — open tabs: {urls}")
+                        except Exception:
+                            pass
+
+                        # Force navigation so Playwright sees logged-in URL if session exists.
+                        for p in context.pages:
+                            try:
+                                u = p.url or ""
+                                if "auth/page/login" in u or u.startswith("about:"):
+                                    print(
+                                        f"  🔄 Session check: navigating tab → {PROFILE_INDEX_URL}"
+                                    )
+                                    p.goto(
+                                        PROFILE_INDEX_URL,
+                                        wait_until="domcontentloaded",
+                                        timeout=30000,
+                                    )
+                            except Exception as ex:
+                                print(f"  ⚠️ Tab navigation skipped: {ex}")
+
+                        last_debug = now
+
+                        # Re-check immediately after nudge
+                        for p in context.pages:
+                            try:
+                                if url_looks_logged_in(p.url):
+                                    print(
+                                        f"  ✅ Login successful! (After nudge: {p.url})"
+                                    )
+                                    login_detected = True
+                                    break
+                            except Exception:
+                                continue
 
                     if login_detected:
                         # Wait a bit for cookies to settle

@@ -1,4 +1,73 @@
+import html as html_lib
 import re
+
+
+def _line_to_safe_p(line_stripped: str):
+    """
+    One visual line -> single <p> with only <strong> for **bold**.
+    All other text is HTML-escaped. No <h*> / <ul> / <b> (Toutiao save is picky).
+    """
+    if not line_stripped:
+        return None
+    s = line_stripped
+    if s.startswith("#"):
+        s = re.sub(r"^#{1,6}\s*", "", s)
+    if s.startswith("- ") or s.startswith("* "):
+        s = "• " + s[2:]
+    parts: list[str] = []
+    pos = 0
+    for m in re.finditer(r"\*\*(.+?)\*\*", s):
+        parts.append(html_lib.escape(s[pos : m.start()]))
+        parts.append(f"<strong>{html_lib.escape(m.group(1))}</strong>")
+        pos = m.end()
+    parts.append(html_lib.escape(s[pos:]))
+    return f"<p>{''.join(parts)}</p>"
+
+
+def convert_safe(text: str) -> str:
+    """
+    Toutiao-oriented Markdown -> minimal HTML (paragraphs + strong only).
+    """
+    lines = text.split("\n")
+    html: list[str] = []
+    in_code_block = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            html.append(f"<p>{html_lib.escape(line)}</p>")
+            continue
+        if not stripped:
+            continue
+        p = _line_to_safe_p(stripped)
+        if p:
+            html.append(p)
+    return "\n".join(html)
+
+
+def markdown_to_plain(text: str) -> str:
+    """Strip Markdown for keyboard.insert_text fallback."""
+    lines_out: list[str] = []
+    in_code = False
+    for line in text.split("\n"):
+        s = line.strip()
+        if s.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            lines_out.append(line.rstrip())
+            continue
+        if not s:
+            lines_out.append("")
+            continue
+        s = re.sub(r"^#{1,6}\s*", "", s)
+        if s.startswith("- ") or s.startswith("* "):
+            s = "• " + s[2:]
+        s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+        lines_out.append(s)
+    return "\n".join(lines_out).strip()
 
 
 def convert(text):
